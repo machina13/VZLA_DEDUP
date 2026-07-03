@@ -59,7 +59,7 @@ Subcomandos: `run`, `ingest`, `validate`, `list-enabled`, `consolidate`.
 
 **Pipeline stages (orden fijo):** Adapter → Parser → PII tokenization →
 Enrichment (deterministic_id, location normalisation) → Confidence score →
-Minor protection → Staging exporter (POST /api/aportes).
+Minor protection → Staging exporter (Supabase/PostgREST batch upsert).
 
 **Solo 1 parser implementado:** `encuentralos` en
 `scrapers/parsers/encuentralos_parser.py`. Parser nuevo necesita: implementar
@@ -86,13 +86,13 @@ Minor protection → Staging exporter (POST /api/aportes).
 ## Testing patterns
 
 Tests 100% offline, sin red real:
-- Staging (`/api/aportes`) se intercepta con `httpx.BaseTransport`
-  inyectado en `StagingExporter` via `_patch_exporter` (ver
-  `test_run_pipeline.py:_StagingTransport`).
+- Staging (`/rest/v1/aportes`, `/rest/v1/source_watermarks` y `/rest/v1/sources`)
+  se intercepta con `httpx.BaseTransport` inyectado en `StagingExporter`
+  via `_patch_exporter` (ver `test_run_pipeline.py:_StagingTransport`).
 - Adapters/parsers se mockean con `unittest.mock.patch` sobre
   `_get_adapter`/`_get_parser`.
-- `patch.dict(os.environ, {"SUPABASE_URL": "...", "SUPABASE_PUBLISHABLE_KEY": "..."})` para
-  credenciales.
+- `patch.dict(os.environ, {"SUPABASE_URL": "...", "SUPABASE_PUBLISHABLE_KEY": "...",
+  "SUPABASE_INGEST_JWT": "..."})` para credenciales de ingest.
 - Fixtures sintéticos en `scrapers/tests/fixtures/`. Nunca datos reales.
 - Sin `PII_SALT`/`PII_HMAC_SECRET` en CI: `cedula_hmac` queda `None`,
   campos PII crudos se eliminan.
@@ -130,22 +130,18 @@ tiene `timeout-minutes: 15` — insuficiente para ese volumen.
 **Si te piden resolver esto:** el fix son dos cosas separadas, no confundirlas:
 1. Agregar `page_size` a `SourceConfig` y pasarlo en `_get_adapter` (reduce
    el número de fetches HTTP).
-2. El cuello de botella más grande es el **POST**, no el fetch — el exporter
-   manda un POST individual por registro a `/api/aportes`. Subir `page_size`
-   no resuelve eso. Cualquier solución de paralelismo en el exporter necesita
-   revisión cuidadosa porque toca el watermark: `export_source` solo avanza
-   el watermark si *todos* los POST de la fuente terminaron en 200/201 —
-   paralelizar sin preservar esa garantía rompe la semántica de "at-least-once"
-   delivery.
+2. El exporter ya usa batch upsert directo a Supabase/PostgREST; para ajustar
+   throughput hay que tocar `bulk_size`, timeout/retry y semántica de
+   watermark, no volver al modelo de POST individual ni paralelismo ciego.
 
 ### Variables de entorno reales — no confiar en README.md
 
-El README raíz puede tener referencias desactualizadas a
-`DATAVZLA_API_KEY`/`DATAVZLA_BASE_URL`/`STAGING_API_KEY`/`STAGING_BASE_URL`.
+El README raíz puede tener referencias desactualizadas a las variables viejas
+`DATAVZLA_*` y `STAGING_*`.
 **Las variables reales que lee `StagingConfig.from_env()` son:**
-- `SUPABASE_URL` — variable de GitHub Actions (URL pública, no secret)
-- `SUPABASE_PUBLISHABLE_KEY` — secret de GitHub Actions (pública por diseño, para header `apikey`)
-- `SUPABASE_INGEST_JWT` — secret de GitHub Actions (JWT firmado con rol `scraper_ingest`)
+- `SUPABASE_URL` — variable de GitHub Actions (URL pública)
+- `SUPABASE_PUBLISHABLE_KEY` — credencial protegida de GitHub Actions para header `apikey`
+- `SUPABASE_INGEST_JWT` — credencial protegida de GitHub Actions con rol `scraper_ingest`
 
 `STAGING_SOURCE_SLUG` **no existe como variable consumida por el código.**
 El `source_slug` siempre sale de `source.id` en `run_pipeline.py`, nunca de

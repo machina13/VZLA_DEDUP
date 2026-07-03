@@ -107,9 +107,10 @@ En producción, el pipeline corre vía `.github/workflows/ingest.yml` (cron`*/10
 export PII_HMAC_SECRET="valor-secreto"
 export PII_SALT="$PII_HMAC_SECRET"   # alias legacy, mismo valor — no son dos secrets distintos
 
-# Credenciales de dataVenezuela (staging exporter)
-export STAGING_API_KEY="x-api-key del scraper"
-export STAGING_BASE_URL="https://..."
+# Supabase/PostgREST (staging exporter)
+export SUPABASE_URL="https://project.supabase.co"
+export SUPABASE_PUBLISHABLE_KEY="credencial protegida del proyecto"
+export SUPABASE_INGEST_JWT="jwt-con-role-scraper_ingest"
 
 # Opcional: solo para fuentes type=x_recent_search habilitadas
 export X_BEARER_CREDENTIAL="credencial Bearer de X API"

@@ -9,10 +9,10 @@ Todos los tests son 100% offline: ninguno hace llamadas de red.
 - Las fuentes de red (api_json) se mockean inyectando adapters/parsers
   falsos en el registry del pipeline via monkeypatch.
 - La fuente demo (manual_file) se construye en ``tmp_path``.
-- El destino staging (/api/aportes) se intercepta con un
+- El destino staging (Supabase/PostgREST) se intercepta con un
   ``_StagingTransport`` (httpx.BaseTransport) inyectado en el StagingExporter
   que construye run_pipeline, parcheando ``StagingExporter`` por una factory
-  de test y exportando las STAGING_* via patch.dict(os.environ).
+  de test y exportando las SUPABASE_* via patch.dict(os.environ).
 
 El JSONL en disco desaparecio: ya no se leen persons.jsonl ni se asserta
 documents_exported. Se asserta sobre los POSTs capturados y sobre

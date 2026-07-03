@@ -37,7 +37,7 @@ _DEFAULT_WATERMARK = "1970-01-01T00:00:00Z"
 _APORTES_PATH = "/rest/v1/aportes"
 _APORTES_UPSERT_PATH = "/rest/v1/aportes?on_conflict=source_id,external_id"
 _WATERMARKS_PATH = "/rest/v1/source_watermarks"
-_SCRAPER_ID = "00000000-0000-0000-0000-000000000001"
+_WATERMARKS_UPSERT_PATH = "/rest/v1/source_watermarks?on_conflict=source_slug"
 
 _WATERMARK_SAFETY_MARGIN = timedelta(minutes=5)
 _FETCHED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -130,6 +130,11 @@ def _apply_safety_margin(watermark_at: str) -> str:
         log.warning("watermark con formato inesperado, sin margen de seguridad: %s", watermark_at)
         return watermark_at
     return (dt - _WATERMARK_SAFETY_MARGIN).strftime(_FETCHED_AT_FORMAT)
+
+
+def _response_preview(resp: httpx.Response, *, limit: int = 300) -> str:
+    """Preview acotado de respuestas HTTP, sin loguear payloads enviados."""
+    return resp.text[:limit].replace("\n", " ").replace("\r", " ")
 
 
 def compute_external_id(rec: dict[str, object], entity_type: str) -> str:
@@ -245,7 +250,6 @@ class StagingExporter:
             "block_keys": specs.block_keys(rec, entity_type),
             "content_hash": _content_hash(clean),
             "source_id": source_id,
-            "scraper_id": _SCRAPER_ID,
             "raw_json": clean,
         }
         for key, value in (
@@ -276,8 +280,13 @@ class StagingExporter:
             else:
                 log.warning(
                     "get_watermark %s: status %s body=%r",
-                    source_slug, resp.status_code, resp.text[:300],
+                    source_slug, resp.status_code, _response_preview(resp),
                 )
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"get_watermark {source_slug}: auth/RLS status {resp.status_code}; "
+                        "abortando fuente para evitar backfill completo"
+                    )
             return _DEFAULT_WATERMARK
         except (httpx.HTTPError, ValueError, AttributeError) as exc:
             log.warning("no se pudo leer watermark de %s: %s", source_slug, exc)
@@ -287,7 +296,7 @@ class StagingExporter:
                     "respuesta HTTP de %s: status=%s body=%r",
                     source_slug,
                     response.status_code,
-                    response.text[:300],
+                    _response_preview(response),
                 )
             return _DEFAULT_WATERMARK
 
@@ -295,13 +304,22 @@ class StagingExporter:
         assert self._client is not None
         try:
             resp = self._post_with_retry(
-                _WATERMARKS_PATH,
+                _WATERMARKS_UPSERT_PATH,
                 {"source_slug": source_slug, "watermark_at": watermark_at},
                 headers={"Prefer": "resolution=merge-duplicates"},
             )
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            log.warning("POST %s watermark fallo definitivo: %s", _WATERMARKS_UPSERT_PATH, exc)
             return False
-        return resp.status_code in (200, 201)
+        if resp.status_code in (200, 201):
+            return True
+        log.warning(
+            "POST %s watermark status=%s body=%s",
+            _WATERMARKS_UPSERT_PATH,
+            resp.status_code,
+            _response_preview(resp),
+        )
+        return False
 
     def _post_with_retry(
         self,
@@ -429,7 +447,7 @@ class StagingExporter:
                     "POST %s status=%s body=%s",
                     _APORTES_UPSERT_PATH,
                     resp.status_code,
-                    resp.text[:300],
+                    _response_preview(resp),
                 )
                 result.errors.append(
                     f"{_APORTES_UPSERT_PATH} status {resp.status_code} "

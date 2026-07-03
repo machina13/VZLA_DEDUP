@@ -122,7 +122,7 @@ class TestPayload:
         body = self._export_one(_person("Juan"))
         always_present = {
             "run_id", "entity_type", "external_id", "dedup_version",
-            "block_keys", "content_hash", "source_id", "scraper_id", "raw_json",
+            "block_keys", "content_hash", "source_id", "raw_json",
         }
         assert always_present.issubset(body.keys())
 
@@ -320,6 +320,66 @@ class TestWatermark:
             "fuente-b": "2026-06-24T19:55:00Z",
         }
 
+    def test_watermark_post_500_retries_then_succeeds(self) -> None:
+        class _Transport(httpx.BaseTransport):
+            def __init__(self) -> None:
+                self.watermark_attempts = 0
+
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/rest/v1/aportes":
+                    return httpx.Response(201, json={})
+                if request.url.path == "/rest/v1/source_watermarks":
+                    self.watermark_attempts += 1
+                    if self.watermark_attempts == 1:
+                        return httpx.Response(500, text="transient")
+                    return httpx.Response(201, json={})
+                if request.url.path == "/rest/v1/sources":
+                    return httpx.Response(200, json=[{"id": _SOURCE_UUID}])
+                return httpx.Response(404)
+
+        transport = _Transport()
+        with patch("scrapers.exporters.staging_exporter.time.sleep", lambda *_: None):
+            res = _exporter(transport).export_source(
+                [_person("Juan")],
+                source_slug="demo",
+                source_fetched_ats=["2026-06-24T16:00:00Z"],
+            )
+
+        assert res.errors == []
+        assert transport.watermark_attempts == 2
+
+    def test_watermark_post_persistent_500_blocks_and_logs_sanitized_body(
+        self, caplog: Any
+    ) -> None:
+        class _Transport(httpx.BaseTransport):
+            def __init__(self) -> None:
+                self.watermark_attempts = 0
+
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/rest/v1/aportes":
+                    return httpx.Response(201, json={})
+                if request.url.path == "/rest/v1/source_watermarks":
+                    self.watermark_attempts += 1
+                    return httpx.Response(500, text="still failing")
+                if request.url.path == "/rest/v1/sources":
+                    return httpx.Response(200, json=[{"id": _SOURCE_UUID}])
+                return httpx.Response(404)
+
+        transport = _Transport()
+        with patch("scrapers.exporters.staging_exporter.time.sleep", lambda *_: None):
+            with caplog.at_level("WARNING", logger="scrapers.exporters.staging_exporter"):
+                res = _exporter(transport).export_source(
+                    [_person("Persona Sensible")],
+                    source_slug="demo",
+                    source_fetched_ats=["2026-06-24T16:00:00Z"],
+                )
+
+        assert res.errors == ["no se pudo actualizar el watermark"]
+        assert transport.watermark_attempts == 4
+        assert "watermark status=500" in caplog.text
+        assert "still failing" in caplog.text
+        assert "Persona Sensible" not in caplog.text
+
 
 # --- margen de seguridad del watermark ---------------------------------------
 
@@ -375,6 +435,23 @@ class TestGetWatermark:
                 return httpx.Response(200, json={"watermark_at": "2026-06-20T00:00:00Z"})
 
         assert _exporter(_Transport()).get_watermark("fuente-a") == "1970-01-01T00:00:00Z"
+
+    def test_401_or_403_abort_instead_of_backfill(self) -> None:
+        class _Transport(httpx.BaseTransport):
+            def __init__(self, status: int) -> None:
+                self.status = status
+
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                return httpx.Response(self.status, text="denied")
+
+        for status in (401, 403):
+            exp = _exporter(_Transport(status))
+            try:
+                exp.get_watermark("fuente-a")
+            except RuntimeError as exc:
+                assert "abortando fuente" in str(exc)
+            else:
+                raise AssertionError(f"status {status} debe abortar, no devolver default")
 
 
 # --- auth ---------------------------------------------------------------

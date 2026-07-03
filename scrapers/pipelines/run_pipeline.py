@@ -39,7 +39,7 @@ Summary devuelto
 El dict de retorno tiene las keys que espera ``cli.py``:
   sources_processed   int  — fuentes completadas sin error fatal
   staging_sent        int  — aportes aceptados por staging (200/201)
-  staging_duplicates  int  — aportes ya existentes en staging (409)
+  staging_duplicates  int  — 0 con PostgREST return=minimal; upsert absorbe reenvios
   staging_errors      int  — errores por registro o de watermark
   quarantined         int  — registros enviados a la Quarantine DB
   quarantine_errors   int  — errores al enviar a cuarentena
@@ -711,9 +711,9 @@ def _run_source(
     # El watermark se lee ANTES del fetch para acotar la ventana
     # (updated_after); en la primera corrida de la fuente (sin watermark
     # previo) vale "1970-01-01T00:00:00Z" y provoca backfill completo.
-    # get_watermark() va DENTRO del try/finally: aunque hace fail-open en
-    # httpx.HTTPError, un fallo no contemplado (ej. JSON malformado) no debe
-    # dejar el adapter sin cerrar (browser, conexiones) ni saltarse el close().
+    # get_watermark() va DENTRO del try/finally: aunque 401/403 abortan la
+    # fuente para evitar backfill completo, cualquier fallo debe cerrar el
+    # adapter (browser, conexiones) antes de salir.
     try:
         watermark_at = exporter.get_watermark(source.id)
         pages = _fetch_pages(adapter, source, watermark_at)
@@ -829,7 +829,7 @@ def run_pipeline(
         Ruta al YAML de configuracion de fuentes.
     output_dir:
         Reservado para artefactos/logs. El export a JSONL desaparecio; el
-        destino ahora es la tabla aportes via /api/aportes. Se conserva en la
+        destino ahora es la tabla aportes via Supabase/PostgREST. Se conserva en la
         firma por compatibilidad con la CLI.
     limit:
         Numero maximo de entidades por fuente (None = sin limite).

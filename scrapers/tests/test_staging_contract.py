@@ -21,7 +21,7 @@ _EVENT_ID = "8f14e45f-ceea-467e-bd5d-0a4f2e0c1a3a"
 # Columnas reales de public.aportes según 0001_init + 0008_ingesta_staging_dedup
 _APORTES_COLUMNS = {
     "run_id", "entity_type", "external_id", "dedup_hash", "dedup_version",
-    "block_keys", "content_hash", "source_id", "scraper_id",
+    "block_keys", "content_hash", "source_id",
     "raw_json", "source_record_id", "source_url",
     "parser_version", "normalizer_version",
 }
@@ -31,7 +31,7 @@ _WATERMARK_COLUMNS = {"source_slug", "watermark_at"}
 
 # Columnas que produce _build_payload (obligatorias + opcionales)
 _PAYLOAD_REQUIRED = {"run_id", "entity_type", "external_id", "dedup_version",
-                     "block_keys", "content_hash", "source_id", "scraper_id", "raw_json"}
+                     "block_keys", "content_hash", "source_id", "raw_json"}
 _PAYLOAD_OPTIONAL = {"dedup_hash", "source_record_id", "source_url",
                      "parser_version", "normalizer_version"}
 
@@ -108,8 +108,9 @@ class TestWatermarkContract:
 
     def test_watermark_body_uses_source_slug(self) -> None:
         """La PK de source_watermarks es source_slug, no slug."""
-        from scrapers.exporters.staging_exporter import _WATERMARKS_PATH as wp
+        from scrapers.exporters.staging_exporter import _WATERMARKS_UPSERT_PATH as wp
         assert "source_watermarks" in wp
+        assert "on_conflict=source_slug" in wp
 
 
 class TestOnConflict:
@@ -125,7 +126,7 @@ class TestOnConflict:
             f"path debe contener on_conflict=source_id,external_id, got: {path}"
         )
 
-    def test_scraper_id_is_constant(self) -> None:
-        from scrapers.exporters.staging_exporter import _SCRAPER_ID
-        assert _SCRAPER_ID, "scraper_id debe ser un UUID no vacio"
-        assert _SCRAPER_ID.count("-") == 4, "scraper_id debe tener formato UUID"
+    def test_payload_does_not_send_synthetic_scraper_id(self) -> None:
+        exp = _exporter_for_payload()
+        payload = exp._build_payload(_person(), "demo_src")
+        assert "scraper_id" not in payload

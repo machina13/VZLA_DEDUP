@@ -27,7 +27,7 @@ Claves de dedup pre-calculadas (dedup_hash, block_keys)
 │  inmutable, trazable        │     │  no redactable, etc.  │
 └─────────────────────────────┘     └──────────────────────┘
       ↓
-Staging exporter → POST /api/aportes → aportes (Supabase)
+Staging exporter → Supabase/PostgREST → aportes
       ↓  consolidation job (cada 20 min)
 Canonical: persons / events / acopio_centers
       ↓  build job (cada 30 min)
@@ -88,7 +88,8 @@ python -m scrapers.cli run --config scrapers/config/sources.yaml --output scrape
 ### Tests
 
 Tests de integración offline en `scrapers/tests/test_run_pipeline.py`. Ninguno
-hace red real: el destino staging (`/api/aportes`) se intercepta con
+hace red real: el destino staging (`/rest/v1/aportes`,
+`/rest/v1/source_watermarks` y `/rest/v1/sources`) se intercepta con
 `httpx.BaseTransport` inyectado en el `StagingExporter`.
 
 ---
@@ -122,7 +123,7 @@ flowchart TD
     F --> G[Normalizer]
     G --> H[Claves de dedup precalculadas]
     H --> I[Technical Validator]
-    I --> J[Staging exporter POST /api/aportes]
+    I --> J[Staging exporter PostgREST batch upsert]
     J --> K[aportes Supabase]
     K --> L[Consolidation / Verification]
 ```
@@ -629,27 +630,39 @@ upsert directo a Supabase via PostgREST.
 Responsabilidades del exporter:
 - Construir el payload del aporte usando los contratos de
   `scrapers/dedup/specs.py`: `run_id`, `entity_type`, `external_id`,
-  `dedup_hash`, `dedup_version`, `block_keys`, `content_hash`, `source_slug`
+  `dedup_hash`, `dedup_version`, `block_keys`, `content_hash`, `source_id`
   y `raw_json` (el record de negocio sin claves internas con prefijo `_`).
   Keys en snake_case, alineadas 1:1 con las columnas reales de `aportes`.
 - `external_id` es determinista (fingerprint v1 para Event/AcopioCenter,
-  `deterministic_id` para Person). PostgREST hace upsert por `external_id`
-  via `Prefer: resolution=merge-duplicates`, así que re-correr la misma
-  fuente no duplica (idempotencia).
+  `deterministic_id` para Person). PostgREST hace upsert por
+  `(source_id, external_id)` via
+  `/rest/v1/aportes?on_conflict=source_id,external_id` y
+  `Prefer: resolution=merge-duplicates,return=minimal`, así que re-correr la
+  misma fuente no duplica (idempotencia).
+- Resolver `source_slug` (`source.id` del YAML) a UUID real en `public.sources`
+  antes de construir payload. Si no se puede resolver en modo activo, el
+  exporter no envía el registro.
 - Enviar en lotes (batch) de hasta 100 registros por request. Cada batch
-  exitoso (201) cuenta como enviado; un batch fallido se registra como error
-  y bloquea el avance del watermark.
-- Avanzar el watermark de la fuente (`POST /rest/v1/source_watermarks` con
-  `Prefer: resolution=merge-duplicates`, body `{"slug": "...", "watermark_at": "<ISO>"}`)
+  exitoso (200/201) cuenta como enviado; un batch fallido se registra como
+  error y bloquea el avance del watermark. Como se usa `return=minimal`,
+  PostgREST no reporta duplicados por fila y `staging_duplicates` queda en 0
+  por diseño.
+- Avanzar el watermark de la fuente (`POST /rest/v1/source_watermarks?on_conflict=source_slug` con
+  `Prefer: resolution=merge-duplicates`, body
+  `{"source_slug": "...", "watermark_at": "<ISO>"}`)
   a `max(fetched_at)` menos un margen de seguridad (`_WATERMARK_SAFETY_MARGIN`,
   ver más abajo) solo cuando todos los batches de esa fuente terminaron en
-  201. Si cualquiera falla, el watermark no cambia.
+  200/201 y no hubo errores previos de la fuente. Si cualquiera falla, el
+  watermark no cambia.
 
 Auth con Supabase: header `apikey` con la publishable key del proyecto
 (`SUPABASE_PUBLISHABLE_KEY`) + `Authorization: Bearer` con un JWT firmado
 con el rol `scraper_ingest` (`SUPABASE_INGEST_JWT`). El JWT se genera una
 sola vez offline contra `SUPABASE_JWT_SECRET` del proyecto y PostgREST lo
 valida localmente, sin requests extra de auth.
+El SQL operativo del PR crea el rol dedicado, lo otorga a `authenticator`,
+agrega el índice único `(source_id, external_id)` y define policies RLS para
+leer `sources`, escribir `aportes` y leer/escribir `source_watermarks`.
 
 ### Semántica del watermark: `fetched_at` (wall-clock local) vs `updated_at` (servidor)
 
@@ -683,9 +696,9 @@ múltiples fuentes (`run_pipeline._run_source` itera todas las habilitadas), as�
 que `source_slug` es siempre `source.id` y se pasa explícito en cada llamada a
 `StagingExporter.get_watermark(source_slug)` / `export_source(..., source_slug=...)`.
 Esto mantiene watermarks independientes por fuente dentro de la misma corrida.
-Como `source.id` viaja sin escapar en el path REST (`/api/source-watermarks/{id}`),
-`validate_sources_config` exige que sea único entre fuentes y que solo contenga
-`[a-zA-Z0-9_-]`.
+Como `source.id` viaja como valor de query/body en PostgREST, no como path
+dinámico, `validate_sources_config` igualmente exige que sea único entre
+fuentes y que solo contenga `[a-zA-Z0-9_-]`.
 
 Antes de hacer el fetch, `_run_source` lee `exporter.get_watermark(source.id)`
 **dentro** del mismo `try/finally` que cierra el adapter, y lo pasa como
@@ -697,10 +710,15 @@ fuente nunca tuvo watermark, `get_watermark` devuelve el default
 Una lectura fallida del watermark (red, 5xx, o un body 2xx con JSON
 malformado/no-dict) tampoco bloquea el fetch ni filtra el cierre del adapter:
 degrada al mismo default en vez de abortar la fuente.
+En cambio, 401/403 en `get_watermark` aborta la fuente para evitar un backfill
+completo por un problema de auth/RLS.
 
-Modo dry-run silencioso: si falta cualquiera de `STAGING_API_KEY` o
-`STAGING_BASE_URL`, el exporter queda deshabilitado, no abre cliente HTTP (cero
-red), loguea a INFO lo que enviaría y termina con `staging_sent=0` sin error.
+Modo dry-run silencioso: si faltan `SUPABASE_URL`,
+`SUPABASE_PUBLISHABLE_KEY` y `SUPABASE_INGEST_JWT`, el exporter queda
+deshabilitado, no abre cliente HTTP (cero red), loguea a INFO lo que enviaría y
+termina con `staging_sent=0` sin error. Si la configuración está parcial,
+loguea ERROR y también entra en dry-run para evitar envíos con credenciales
+incompletas.
 
 El exporter no toma decisiones de dedup. Su única responsabilidad es persistir
 en staging; el dedup vive en el consolidation job (#82).
@@ -868,14 +886,15 @@ Son responsabilidades distintas.
 
 ---
 
-## 10. Staging (POST /api/aportes)
+## 10. Staging (Supabase/PostgREST)
 
 El export a JSONL en disco fue eliminado en #81. El destino final es la tabla
-`aportes` de dataVenezuela vía `POST /api/aportes` (ver "Capa 4 — Staging
-exporter"). Cada aporte es un objeto JSON con `external_id` determinista para
+`aportes` de Supabase vía PostgREST (`POST /rest/v1/aportes?on_conflict=source_id,external_id`,
+ver "Capa 4 — Staging exporter"). Vercel queda fuera del ingest. Cada aporte
+es un objeto JSON en snake_case con `external_id` determinista para
 idempotencia.
 
-Ejemplo de payload (un POST por registro):
+Ejemplo de payload (enviado dentro de un batch):
 
 ```json
 {
@@ -886,8 +905,8 @@ Ejemplo de payload (un POST por registro):
   "dedup_version": "person-detid-v1",
   "block_keys": ["ced:uuid-v4:hmac", "phon:uuid-v4:lara:JN"],
   "content_hash": "sha256-hex",
-  "source_slug": "encuentralos",
-  "data": {"full_name": "JOSE PEREZ", "event_id": "uuid-v4"}
+  "source_id": "uuid-v4-de-public-sources",
+  "raw_json": {"full_name": "JOSE PEREZ", "event_id": "uuid-v4"}
 }
 ```
 
@@ -898,15 +917,15 @@ Ejemplo de payload (un POST por registro):
 Cada aporte debe cumplir:
 
 1. UTF-8, JSON válido.
-2. Un POST por registro.
-3. `external_id` determinista (idempotencia por upsert).
+2. Batch upsert via PostgREST con `apikey` + `Authorization: Bearer`.
+3. `external_id` determinista y unique operativo `(source_id, external_id)`.
 4. Campos requeridos presentes.
 5. Campos desconocidos como `null`.
 6. Fechas en UTC ISO 8601.
 7. IDs como UUID v4.
 8. Enums controlados.
-9. Sin PII en claro (`data` ya viene redactado).
-10. Trazabilidad hacia fuente (`source_slug`).
+9. Sin PII en claro (`raw_json` ya viene redactado).
+10. Trazabilidad hacia fuente (`source_id`, resuelto desde `sources.slug`).
 
 ---
 
@@ -917,8 +936,8 @@ Quarantine DB (ver "Capa 4b"). El scraper hace un POST por registro no
 procesable. `run_id` se comparte con el aporte de la misma corrida.
 
 Ejemplo de payload (campos que envía el `QuarantineExporter`). **Claves en
-camelCase**: es el contrato de la API de dataVenezuela (schema Zod, igual que
-`/api/aportes`); el backend las mapea a columnas snake_case:
+camelCase**: es el contrato de la API de cuarentena de dataVenezuela (schema
+Zod); el backend las mapea a columnas snake_case:
 
 ```json
 {
@@ -1236,7 +1255,7 @@ python -m scrapers.cli validate --config scrapers/config/sources.demo.yaml
 | PII HMAC (`shared/hashing.py`) | ✅ |
 | Normalización (texto, fechas, ubicaciones, NLP) | ✅ |
 | Modelos Pydantic (Person/AcopioCenter/Event) | ⏳ fix #85 pendiente |
-| Staging exporter (`POST /api/aportes`) | ✅ Issue #81 |
+| Staging exporter (Supabase/PostgREST) | ✅ Issue #81 / #200 |
 | Dedup specs + fingerprint v1 | ✅ Issue #81 |
 | Raw artifact store (R2) | ❌ bloqueado por #81 |
 | Quarantine exporter (`POST /api/v1/quarantine`) + ruteo | ✅ Issue #88 (scraper) |
@@ -1256,7 +1275,7 @@ completo dirigido a agentes.
 
 **Confirmado funcionando:**
 - `encuentralos_tecnosoft` end-to-end: fetch → parse → PII → normalización →
-  POST `/api/aportes` → tabla `aportes` en Supabase.
+  batch upsert PostgREST → tabla `aportes` en Supabase.
 - Watermark filtering activo: el log de producción muestra
   `updated_after=...` en la query real al adapter.
 - `ingest.yml` ya invoca `python -m scrapers.cli --verbose ingest` — el
@@ -1268,12 +1287,11 @@ completo dirigido a agentes.
 la nota original del YAML — la fuente escaló después de que se escribió esa
 estimación. Con `page_size=20` (hardcodeado, ver `docs/source_config.md`)
 eso son ~4.941 páginas. El timeout de 15 minutos en `ingest.yml` no alcanza
-para ese volumen ni para el fetch ni mucho menos para los ~98.830 POST
-individuales subsecuentes a `/api/aportes`. Subir `page_size` reduce el
-costo del fetch pero no toca el cuello de botella real, que es el POST
-secuencial por registro en `staging_exporter.export_source`. Cualquier
-solución de paralelismo ahí debe preservar la garantía de que el watermark
-solo avanza si **todos** los POST de la fuente terminaron en 200/201 (ver
+para ese volumen. El ingest ya no hace POST individual a `/api/aportes`;
+usa batch upsert directo a PostgREST. Subir `page_size` reduce el costo del
+fetch, pero el throughput final también depende de `bulk_size`, timeout/retry
+del exporter y la garantía de que el watermark solo avanza si **todos** los
+batches de la fuente terminaron en 200/201 (ver
 "Capa 4 — Staging exporter" arriba) — paralelizar sin preservar esa
 garantía rompe la semántica de at-least-once delivery documentada.
 
